@@ -1,4 +1,5 @@
 import glob
+import inspect
 import math
 import numpy as np
 import os
@@ -13,6 +14,9 @@ from tqdm import tqdm
 from contextlib import nullcontext
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
+
+
+_AMP_HAS_DEVICE_TYPE = "device_type" in inspect.signature(amp_autocast).parameters
 
 
 class DummyScheduler:
@@ -207,7 +211,12 @@ class Trainer:
     def step(self, x, y, update=True):
         B = x.shape[0]
         if self.use_amp:
-            autocast_ctx = amp_autocast(device_type=self.device_type, dtype=self.amp_dtype)
+            autocast_kwargs = {}
+            if self.amp_dtype is not None:
+                autocast_kwargs["dtype"] = self.amp_dtype
+            if _AMP_HAS_DEVICE_TYPE:
+                autocast_kwargs["device_type"] = self.device_type
+            autocast_ctx = amp_autocast(**autocast_kwargs)
         else:
             autocast_ctx = nullcontext()
 
