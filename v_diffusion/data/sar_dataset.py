@@ -142,14 +142,29 @@ class SARDataset(Dataset):
     ) -> None:
         super().__init__()
         self.root = os.path.abspath(os.path.expanduser(root))
+        root_path = Path(self.root)
+        if not root_path.exists():
+            raise FileNotFoundError(
+                f"Dataset root {self.root} does not exist. "
+                "Set --root or data.root in the config to a folder that stores SAR PNG files."
+            )
         self.image_size = image_size
         self.center_crop = center_crop
         self.random_flip = random_flip
         self.angle_bin_size = angle_bin_size if metadata is None else metadata.angle_bin_size
 
-        self.image_paths = sorted(str(p) for p in Path(self.root).rglob("*.png"))
+        allowed_exts = {".png", ".jpg", ".jpeg"}
+        self.image_paths = sorted(
+            str(p)
+            for p in root_path.rglob("*")
+            if p.is_file() and p.suffix.lower() in allowed_exts
+        )
         if not self.image_paths:
-            raise FileNotFoundError(f"No PNG files found under {self.root}")
+            raise FileNotFoundError(
+                "No image files were found under "
+                f"{self.root}. Supported extensions: {sorted(allowed_exts)}. "
+                "Ensure the dataset follows the pattern 'class_angle_jamA_jamP.png'."
+            )
 
         self.items: List[Dict[str, object]] = []
         if metadata is None:
