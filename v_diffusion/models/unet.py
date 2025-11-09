@@ -99,6 +99,11 @@ class XFormersAttentionBlock(BaseAttentionBlock):
         k = self.to_k(x).reshape(B, -1, self.num_heads, self.head_dim).contiguous()
         v = self.to_v(x).reshape(B, -1, self.num_heads, self.head_dim).contiguous()
         x = memory_efficient_attention(q, k, v)
+        # memory_efficient_attention returns a tensor shaped as
+        # (B, HW, num_heads, head_dim). Collapse the head dimension back to
+        # the expected hidden width before projecting so the linear layer sees
+        # a consistent in_features size when xFormers is enabled.
+        x = x.reshape(B, -1, self.hid_dim)
         x = self.proj_out(x)
         return x.transpose(1, 2).reshape(B, -1, H, W) + skip
 
