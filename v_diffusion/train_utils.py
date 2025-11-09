@@ -5,6 +5,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.distributed as tdist
+from torch.cuda.amp import autocast as amp_autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel
 from .utils import save_image, EMA
 from .metrics.fid_score import InceptionStatistics, get_precomputed, calc_fd
@@ -86,6 +87,8 @@ class Trainer:
             rank=0,  # process id for distributed training
             world_size=1,  # total number of processes
             save_rng_state=False,  # whether to save the rng state of each device
+            amp_enabled=False,
+            amp_dtype="fp16",
     ):
         self.model = model
         self.optimizer = optimizer
@@ -120,6 +123,24 @@ class Trainer:
         self.is_leader = rank == 0
         self.world_size = world_size
         self.save_rng_state = save_rng_state
+
+        self.device_type = device.type
+        self.use_amp = bool(amp_enabled and self.device_type == "cuda" and torch.cuda.is_available())
+        dtype_map = {
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "half": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
+        if isinstance(amp_dtype, torch.dtype):
+            resolved_dtype = amp_dtype
+        elif isinstance(amp_dtype, str):
+            resolved_dtype = dtype_map.get(amp_dtype.lower(), torch.float16)
+        else:
+            resolved_dtype = torch.float16
+        self.amp_dtype = resolved_dtype if self.use_amp else None
+        self.grad_scaler = GradScaler() if self.use_amp and self.amp_dtype == torch.float16 else None
 
         assert num_save_images % world_size == 0
         self.local_num_save_images = num_save_images // world_size
@@ -185,23 +206,42 @@ class Trainer:
 
     def step(self, x, y, update=True):
         B = x.shape[0]
-        loss = self.loss(x, y).mean()
-        loss.div(self.num_accum).backward()
-        loss = loss.detach()
+        if self.use_amp:
+            autocast_ctx = amp_autocast(device_type=self.device_type, dtype=self.amp_dtype)
+        else:
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            losses = self.loss(x, y)
+            loss = losses.mean()
+
+        scaled_loss = loss / self.num_accum
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+
+        stat_loss = loss.detach().float()
         if self.distributed:
-            tdist.reduce(loss, dst=0, op=tdist.ReduceOp.SUM)  # synchronize losses
-            loss.div_(self.world_size)
+            tdist.reduce(stat_loss, dst=0, op=tdist.ReduceOp.SUM)  # synchronize losses
+            stat_loss.div_(self.world_size)
         if update:
-            # gradient clipping by global norm
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_norm)
-            self.optimizer.step()
+            if self.grad_scaler is not None:
+                self.grad_scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_norm)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                # gradient clipping by global norm
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_norm)
+                self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             # adjust learning rate every step (warming up)
             self.scheduler.step()
             if self.is_leader and self.use_ema:
                 assert isinstance(self.ema, EMA)
                 self.ema.update()
-        self.stats.update(B, loss=loss.item() * B)
+        self.stats.update(B, loss=stat_loss.item() * B)
 
     def sample_fn(self, label, diffusion=None, use_ddim=False):
         if diffusion is None:

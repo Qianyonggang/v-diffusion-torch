@@ -234,6 +234,33 @@ def main(args):
             is_leader=is_leader
         )  # drop_last to have a static input shape; num_workers > 0 to enable asynchronous data loading
 
+    # speedup parameters (mixed precision, kernel accelerations)
+    speedup_cfg = config.setdefault("speedup", {})
+    update_speedup = partial(update_config, old_config=speedup_cfg, new_config=args)
+    cudnn_benchmark = update_speedup("cudnn_benchmark", logical_op="OR")
+    allow_tf32 = update_speedup("allow_tf32", logical_op="OR")
+    allow_fp16 = update_speedup("allow_fp16", logical_op="OR")
+    allow_bf16 = update_speedup("allow_bf16", logical_op="OR")
+    use_amp = update_speedup("use_amp", logical_op="OR")
+    amp_dtype_key = update_speedup("amp_dtype")
+
+    if config["model"].get("use_xformers", False) and not use_amp:
+        logger("xFormers attention benefits from mixed precision; enabling AMP automatically.")
+        use_amp = True
+        speedup_cfg["use_amp"] = True
+    if use_amp and amp_dtype_key is None:
+        amp_dtype_key = "fp16"
+        speedup_cfg["amp_dtype"] = amp_dtype_key
+    amp_dtype_choice = amp_dtype_key
+    if use_amp and train_device.type != "cuda":
+        logger("AMP requested but training device is not CUDA; disabling AMP.")
+        use_amp = False
+    if not use_amp:
+        amp_dtype_choice = None
+    elif isinstance(amp_dtype_choice, str):
+        amp_dtype_choice = amp_dtype_choice.lower()
+    speedup_cfg["use_amp"] = use_amp
+
     timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S%f")
 
     exp_dir = os.path.join(args.exp_dir, f"dpm_{exp_name}", timestamp)
@@ -274,6 +301,8 @@ def main(args):
         rank=rank,
         world_size=world_size,
         save_rng_state=save_rng_state,
+        amp_enabled=use_amp,
+        amp_dtype=amp_dtype_choice,
     )
     evaluator = Evaluator(dataset=dataset, device=eval_device) if args.eval else None
     # in case of elastic launch, resume should always be turned on
@@ -287,13 +316,6 @@ def main(args):
         except FileNotFoundError:
             logger("Checkpoint file does not exist!")
             logger("Starting from scratch...")
-
-    # speedup parameters
-    update_speedup = partial(update_config, old_config=config.get("speedup", {}), new_config=args)
-    cudnn_benchmark = update_speedup("cudnn_benchmark", logical_op="OR")
-    allow_tf32 = update_speedup("allow_tf32", logical_op="OR")
-    allow_fp16 = update_speedup("allow_fp16", logical_op="OR")
-    allow_bf16 = update_speedup("allow_bf16", logical_op="OR")
 
     device_name = torch.cuda.get_device_name()
     allow_tf32 = any(
@@ -322,7 +344,13 @@ def main(args):
         logger(f"{'Enabled' if allow_fp16 else 'Disabled'} reduced precision reductions in fp16 GEMMs")
         if torch.version.__version__.split("+")[0].split(".") >= ["2", "0", "0"]:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = allow_bf16
-            logger(f"{'Enabled' if allow_fp16 else 'Disabled'} reduced precision reductions in bf16 GEMMs")
+            logger(f"{'Enabled' if allow_bf16 else 'Disabled'} reduced precision reductions in bf16 GEMMs")
+
+    logger(
+        "Automatic mixed precision: "
+        f"{'ON' if use_amp else 'OFF'}"
+        + (f" ({amp_dtype_choice})" if use_amp and amp_dtype_choice else "")
+    )
 
     if is_leader:
         os.makedirs(exp_dir, exist_ok=True)
@@ -401,6 +429,8 @@ if __name__ == "__main__":
     parser.add_argument("--allow-fp16", action="store_true", help="whether allowing using float16 (fp16)")
     parser.add_argument("--allow-bf16", action="store_true", help="whether allowing using bfloat16 (bf16)")
     parser.add_argument("--use-xformers", action="store_true", help="whether to use memory efficient attention")
+    parser.add_argument("--use-amp", action="store_true", help="enable automatic mixed precision training")
+    parser.add_argument("--amp-dtype", type=str, choices=["fp16", "bf16"], help="AMP compute dtype override")
     parser.add_argument("--max-ckpts-kept", type=int, help="maximum number of checkpoints to keep on disk (none for no cap)")
     parser.add_argument("--dataset", type=str, choices=list(DATA_INFO.keys()) + ["sar"], help="override dataset name")
     parser.add_argument("--root", type=str, help="dataset root directory override")

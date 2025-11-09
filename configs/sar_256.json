@@ -38,6 +38,14 @@
     "w_guide": 2.0,
     "p_uncond": 0.1
   },
+  "speedup": {
+    "cudnn_benchmark": true,
+    "allow_tf32": true,
+    "allow_fp16": true,
+    "allow_bf16": false,
+    "use_amp": true,
+    "amp_dtype": "fp16"
+  },
   "train": {
     "seed": 1234,
     "epochs": 800,
