@@ -4,6 +4,8 @@ import json
 import torch
 from datetime import datetime
 from torch.optim import AdamW, lr_scheduler
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from v_diffusion import *
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -28,18 +30,59 @@ def main(args):
         defaults: dict = json.load(f)
     fill_with_defaults(config, defaults)
 
+    if hasattr(args, "root") and args.root is not None:
+        args.data_root = args.root
+
     # dataset parameters
     update_data = partial(update_config, old_config=config.get("data", {}), new_config=args)
-    dataset = config["data"]["name"]
+    dataset = update_data("name", "dataset")
     root = update_data("root", "data_root")
     if "~" in root:
         root = os.path.expanduser(root)
     if "$" in root:
         root = os.path.expandvars(root)
 
-    in_channels = DATA_INFO[dataset]["channels"]
-    image_res = DATA_INFO[dataset]["resolution"]
-    image_shape = (in_channels, ) + image_res
+    is_sar = dataset == "sar"
+    sar_metadata = None
+    metadata_path = None
+    if is_sar:
+        from v_diffusion.data.sar_dataset import SARDataset, SARDatasetMetadata
+
+        data_cfg = config.setdefault("data", {})
+        data_cfg.setdefault("image_size", 256)
+        data_cfg.setdefault("angle_bin_size", None)
+        data_cfg.setdefault("center_crop", True)
+        data_cfg.setdefault("random_flip", False)
+        data_cfg.setdefault("metadata_path", None)
+
+        image_size = update_data("image_size", "image_size")
+        angle_bin_size = update_data("angle_bin_size", "angle_bin_size")
+        center_crop = data_cfg.get("center_crop", True)
+        random_flip = data_cfg.get("random_flip", False)
+        metadata_path = update_data("metadata_path", "sar_metadata_path")
+
+        if metadata_path is not None and os.path.exists(metadata_path):
+            sar_metadata = SARDatasetMetadata.load_metadata(metadata_path)
+
+        train_dataset = SARDataset(
+            root=root,
+            image_size=image_size,
+            center_crop=center_crop,
+            random_flip=random_flip,
+            angle_bin_size=angle_bin_size,
+            metadata=sar_metadata,
+        )
+        sar_metadata = train_dataset.metadata
+        in_channels = 1
+        image_res = (image_size, image_size)
+        image_shape = (in_channels, ) + image_res
+        multitags = False
+    else:
+        in_channels = DATA_INFO[dataset]["channels"]
+        image_res = DATA_INFO[dataset]["resolution"]
+        image_shape = (in_channels, ) + image_res
+        multitags = DATA_INFO[dataset].get("multitags", False)
+        train_dataset = None
 
     # conditional parameters
     update_cond = partial(update_config, old_config=config.get("conditional", {}), new_config=args)
@@ -47,9 +90,11 @@ def main(args):
     w_guide = update_cond("w_guide")
     p_uncond = update_cond("p_uncond")
 
-    multitags = DATA_INFO[dataset].get("multitags", False)
     if use_cfg:
-        num_classes = DATA_INFO[dataset].get("num_classes", 0)
+        if is_sar:
+            num_classes = sar_metadata.num_classes
+        else:
+            num_classes = DATA_INFO[dataset].get("num_classes", 0)
     else:
         num_classes = 0
 
@@ -121,9 +166,15 @@ def main(args):
         assert "model_out_type" in config["diffusion"]
         out_channels = 2 * in_channels if model_out_type == "both" else in_channels
         config["model"]["out_channels"] = out_channels
+    sar_num_angles = sar_metadata.num_angles if is_sar else 0
+    sar_num_jam_a = sar_metadata.num_jam_a if is_sar else 0
+    sar_num_jam_p = sar_metadata.num_jam_p if is_sar else 0
     _model = UNet(
         num_classes=num_classes,
         multitags=multitags,
+        num_angles=sar_num_angles,
+        num_jam_a=sar_num_jam_a,
+        num_jam_p=sar_num_jam_p,
         **config["model"])
 
     if distributed:
@@ -163,11 +214,25 @@ def main(args):
 
     split = "all" if dataset == "celeba" else "train"
     num_workers = args.num_workers
-    trainloader, sampler = get_dataloader(
-        dataset, batch_size=batch_size // args.num_accum, split=split, val_size=0., random_seed=seed,
-        root=root, drop_last=True, pin_memory=True, num_workers=num_workers, distributed=distributed,
-        is_leader=is_leader
-    )  # drop_last to have a static input shape; num_workers > 0 to enable asynchronous data loading
+    if is_sar:
+        sampler = DistributedSampler(
+            train_dataset, shuffle=True, drop_last=True, seed=seed
+        ) if distributed else None
+        trainloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size // args.num_accum,
+            shuffle=sampler is None,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+    else:
+        trainloader, sampler = get_dataloader(
+            dataset, batch_size=batch_size // args.num_accum, split=split, val_size=0., random_seed=seed,
+            root=root, drop_last=True, pin_memory=True, num_workers=num_workers, distributed=distributed,
+            is_leader=is_leader
+        )  # drop_last to have a static input shape; num_workers > 0 to enable asynchronous data loading
 
     timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S%f")
 
@@ -264,6 +329,16 @@ def main(args):
         os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(ckpt_dir, exist_ok=True)
 
+        if is_sar:
+            if metadata_path is None:
+                metadata_path = os.path.join(exp_dir, "sar_metadata.json")
+            metadata_dir = os.path.dirname(metadata_path)
+            if metadata_dir:
+                os.makedirs(metadata_dir, exist_ok=True)
+            sar_metadata.save_metadata(metadata_path)
+            config["data"]["metadata_path"] = metadata_path
+            config["data"]["angle_bin_size"] = sar_metadata.angle_bin_size
+
         # keep a record of hyperparameter settings used for current experiment
         with open(os.path.join(exp_dir, f"config.json"), "w") as f:
             config["args"] = vars(args)
@@ -327,6 +402,11 @@ if __name__ == "__main__":
     parser.add_argument("--allow-bf16", action="store_true", help="whether allowing using bfloat16 (bf16)")
     parser.add_argument("--use-xformers", action="store_true", help="whether to use memory efficient attention")
     parser.add_argument("--max-ckpts-kept", type=int, help="maximum number of checkpoints to keep on disk (none for no cap)")
+    parser.add_argument("--dataset", type=str, choices=list(DATA_INFO.keys()) + ["sar"], help="override dataset name")
+    parser.add_argument("--root", type=str, help="dataset root directory override")
+    parser.add_argument("--image-size", type=int, help="SAR image resolution override")
+    parser.add_argument("--angle-bin-size", type=float, help="angle bin size for SAR dataset")
+    parser.add_argument("--sar-metadata-path", type=str, help="path to an existing SAR metadata JSON")
 
     # "OR"-type flags: use_cfg, use_ema, allow_rescale, x0eps_coef
     parser.add_argument("--use-cfg", action="store_true", help="whether to use classifier-free guidance")

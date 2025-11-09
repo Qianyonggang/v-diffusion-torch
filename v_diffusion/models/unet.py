@@ -166,6 +166,10 @@ class UNet(nn.Module):
             num_heads=None,
             num_classes=0,
             multitags=False,
+            num_angles=0,
+            num_jam_a=0,
+            num_jam_p=0,
+            cond_embed_each=None,
             resample_with_res=True,
             use_xformers=False
     ):
@@ -187,6 +191,11 @@ class UNet(nn.Module):
         self.num_heads = num_heads
         self.num_classes = num_classes
         self.multitags = multitags
+        self.num_angles = num_angles
+        self.num_jam_a = num_jam_a
+        self.num_jam_p = num_jam_p
+        self.use_multi_condition = any([num_classes, num_angles, num_jam_a, num_jam_p]) and not multitags and any([num_angles, num_jam_a, num_jam_p])
+        self.cond_embed_each = cond_embed_each or self.embedding_dim
         self.resample_with_res = resample_with_res
 
         if use_xformers and not _xformers_available:
@@ -204,7 +213,14 @@ class UNet(nn.Module):
             Linear(self.embedding_dim, self.embedding_dim)
         )
 
-        if self.num_classes > 0:
+        if self.use_multi_condition:
+            assert self.num_classes > 0 and not multitags
+            self.class_embed = nn.Embedding(self.num_classes, self.cond_embed_each)
+            self.angle_embed = nn.Embedding(self.num_angles, self.cond_embed_each)
+            self.jam_a_embed = nn.Embedding(self.num_jam_a, self.cond_embed_each)
+            self.jam_p_embed = nn.Embedding(self.num_jam_p, self.cond_embed_each)
+            self.cond_proj = Linear(4 * self.cond_embed_each, self.embedding_dim)
+        elif self.num_classes > 0:
             if multitags:
                 self.class_embed = nn.Linear(
                     self.num_classes, self.embedding_dim)
@@ -286,7 +302,11 @@ class UNet(nn.Module):
     def forward(self, x, t, y=None):
         t_emb = get_timestep_embedding(t, self.hid_channels)
         t_emb = self.time_embed(t_emb)
-        if self.num_classes and y is not None:
+        if self.use_multi_condition and y is not None:
+            cond_vec = self.get_multi_condition_embedding(y, t_emb.device)
+            if cond_vec is not None:
+                t_emb += cond_vec
+        elif self.num_classes and y is not None:
             if self.multitags:
                 assert y.ndim == 2
                 y = y.div(torch.count_nonzero(
@@ -320,6 +340,27 @@ class UNet(nn.Module):
 
         h = self.out_conv(h)
         return h
+
+    def get_multi_condition_embedding(self, condition, device):
+        if not isinstance(condition, dict):
+            return None
+        class_ids = condition.get("class_id")
+        angle_ids = condition.get("angle_id")
+        jam_a_ids = condition.get("jam_a_id")
+        jam_p_ids = condition.get("jam_p_id")
+        if any(v is None for v in (class_ids, angle_ids, jam_a_ids, jam_p_ids)):
+            return None
+        class_emb = self.class_embed(class_ids.to(device))
+        angle_emb = self.angle_embed(angle_ids.to(device))
+        jam_a_emb = self.jam_a_embed(jam_a_ids.to(device))
+        jam_p_emb = self.jam_p_embed(jam_p_ids.to(device))
+        cond_cat = torch.cat([class_emb, angle_emb, jam_a_emb, jam_p_emb], dim=-1)
+        cond_vec = self.cond_proj(cond_cat)
+        cond_mask = condition.get("cond_mask")
+        if cond_mask is not None:
+            mask = cond_mask.to(device=device, dtype=cond_vec.dtype).unsqueeze(-1)
+            cond_vec = cond_vec * mask
+        return cond_vec
 
 
 if __name__ == "__main__":

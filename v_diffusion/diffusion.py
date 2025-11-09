@@ -290,6 +290,52 @@ class GaussianDiffusion:
         self.p_uncond = p_uncond
         self.x0eps_coef = x0eps_coef
 
+    @staticmethod
+    def _prepare_label(label, device):
+        if label is None:
+            return None
+        if isinstance(label, dict):
+            prepared = {}
+            batch_size = None
+            for key, value in label.items():
+                if torch.is_tensor(value):
+                    tensor = value.to(device)
+                    prepared[key] = tensor
+                    if batch_size is None and tensor.ndim > 0:
+                        batch_size = tensor.shape[0]
+                else:
+                    prepared[key] = value
+            if batch_size is not None:
+                cond_mask = prepared.get("cond_mask")
+                if cond_mask is None:
+                    prepared["cond_mask"] = torch.ones(batch_size, dtype=torch.float32, device=device)
+                elif torch.is_tensor(cond_mask):
+                    prepared["cond_mask"] = cond_mask.to(device)
+            return prepared
+        if torch.is_tensor(label):
+            return label.to(device)
+        return label
+
+    def _maybe_dropout_condition(self, label, batch_size, device):
+        if label is None or not self.p_uncond:
+            return label
+        keep_mask = torch.rand((batch_size,), device=device) > self.p_uncond
+        if isinstance(label, dict):
+            dropped = {}
+            for key, value in label.items():
+                if torch.is_tensor(value):
+                    dropped[key] = value.clone()
+                else:
+                    dropped[key] = value
+            mask = keep_mask.float()
+            if "cond_mask" in dropped and torch.is_tensor(dropped["cond_mask"]):
+                dropped["cond_mask"] = dropped["cond_mask"] * mask
+            else:
+                dropped["cond_mask"] = mask
+            return dropped
+        mask = broadcast_to(keep_mask.float(), label)
+        return label * mask
+
     def t2logsnr(self, *ts, x=None):
         _broadcast_to = lambda t: broadcast_to(self.logsnr_fn(t), x=x)
         return tuple(map(_broadcast_to, ts))
@@ -366,10 +412,21 @@ class GaussianDiffusion:
         cond = broadcast_to(step > 0, x_t, dtype=torch.bool)
 
         use_cfg = (self.w_guide > 0) and (y is not None)
-        _repeat = partial(repeat_along_dim, repeats=1 + int(use_cfg))
-        if use_cfg:
-            x_t, t, y = _repeat(x_t), _repeat(t), _repeat(y)
-            y[1::2] = 0
+        repeats = 1 + int(use_cfg)
+        _repeat = partial(repeat_along_dim, repeats=repeats)
+        x_t = _repeat(x_t)
+        t = _repeat(t)
+        if isinstance(y, dict):
+            if use_cfg:
+                y = {k: _repeat(v) if torch.is_tensor(v) else v for k, v in y.items()}
+                if "cond_mask" in y and torch.is_tensor(y["cond_mask"]):
+                    y["cond_mask"][1::2] = 0
+            else:
+                y = {k: v if not torch.is_tensor(v) else v for k, v in y.items()}
+        elif y is not None:
+            y = _repeat(y)
+            if use_cfg:
+                y[1::2] = 0
 
         model_out = denoise_fn(x_t, t, y)
         model_mean, model_logvar, pred_x_0 = self.p_mean_var(
@@ -405,8 +462,7 @@ class GaussianDiffusion:
             x_t = torch.randn(shape, device=device, generator=generator)
         else:
             x_t = noise.to(device)
-        if label is not None:
-            label = label.to(device)
+        label = self._prepare_label(label, device)
         for ti in reversed(range(self.sample_timesteps)):
             t.fill_(ti)
             x_t = self.p_sample_step(
@@ -430,6 +486,7 @@ class GaussianDiffusion:
         L = self.sample_timesteps // pred_freq
         preds = torch.zeros((L, B) + shape[1:], dtype=torch.float32)
         idx = L
+        label = self._prepare_label(label, device)
         for ti in reversed(range(self.sample_timesteps)):
             t.fill_(ti)
             x_t, pred = self.p_sample_step(
@@ -505,7 +562,10 @@ class GaussianDiffusion:
 
         logsnr_t = self.t2logsnr(t, x=x_0)[0]
         x_t = q_sample(x_0, logsnr_t, eps=noise)
-        model_out = denoise_fn(x_t, t, y)
+        B = x_0.shape[0]
+        prepared_y = self._prepare_label(y, x_0.device)
+        prepared_y = self._maybe_dropout_condition(prepared_y, B, x_0.device)
+        model_out = denoise_fn(x_t, t, prepared_y)
 
         if self.loss_type == "kl":
             logsnr_s = self.t2logsnr(s, x=x_0)[0]
@@ -523,10 +583,6 @@ class GaussianDiffusion:
                 "snr_trunc": (x_0, noise),
                 "snr_1plus": pred_v_from_x0eps(x_0, noise, logsnr_t)
             }[self.reweight_type]
-
-            if self.p_uncond and y is not None:
-                y *= broadcast_to(
-                    torch.rand((y.shape[0],)) > self.p_uncond, y)
 
             predict = self.from_model_out_to_pred(
                 x_t, model_out, logsnr_t

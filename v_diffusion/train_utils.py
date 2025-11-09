@@ -96,7 +96,11 @@ class Trainer:
         self.trainloader = trainloader
         self.sampler = sampler
         if shape is None:
-            shape = next(iter(trainloader))[0].shape[1:]
+            first_batch = next(iter(trainloader))
+            if isinstance(first_batch, dict):
+                shape = first_batch["images"].shape[1:]
+            else:
+                shape = first_batch[0].shape[1:]
         self.shape = shape
         self.scheduler = DummyScheduler() if scheduler is None else scheduler
 
@@ -127,12 +131,43 @@ class Trainer:
 
         self.use_cfg = use_cfg
         self.use_ema = use_ema
+        self.has_multi_condition = hasattr(trainloader.dataset, "sample_condition_batch")
         if self.is_leader and use_ema:
             self.ema = EMA(self.model, decay=ema_decay)
         else:
             self.ema = nullcontext()
 
         self.stats = RunningStatistics(loss=None)
+
+    def _prepare_condition(self, condition):
+        if condition is None:
+            return None
+        if isinstance(condition, dict):
+            prepared = {}
+            batch_size = None
+            for key, value in condition.items():
+                if torch.is_tensor(value):
+                    prepared[key] = value.to(self.device)
+                    if batch_size is None and value.ndim > 0:
+                        batch_size = value.shape[0]
+                else:
+                    prepared[key] = value
+            if "cond_mask" in prepared and torch.is_tensor(prepared["cond_mask"]):
+                prepared["cond_mask"] = prepared["cond_mask"].to(self.device)
+            elif batch_size is not None:
+                prepared["cond_mask"] = torch.ones(batch_size, dtype=torch.float32, device=self.device)
+            return prepared
+        if torch.is_tensor(condition):
+            return condition.to(self.device)
+        return condition
+
+    @staticmethod
+    def _split_batch(batch):
+        if isinstance(batch, dict):
+            images = batch["images"]
+            labels = {k: batch[k] for k in batch if k != "images"}
+            return images, labels
+        return batch
 
     def loss(self, x, y):
         B = x.shape[0]
@@ -172,10 +207,11 @@ class Trainer:
         if diffusion is None:
             diffusion = self.diffusion
         shape = (self.local_num_save_images, *self.shape)
+        cond = self._prepare_condition(label)
         with self.ema:
             sample = diffusion.p_sample(
                 denoise_fn=self.model, shape=shape, device=self.device, noise=None,
-                label=label, seed=self.sample_seed, use_ddim=use_ddim)
+                label=cond, seed=self.sample_seed, use_ddim=use_ddim)
         if self.distributed:
             # equalizes GPU memory usages across all processes within the same process group
             sample_list = [torch.zeros(shape, device=self.device) for _ in range(self.world_size)]
@@ -185,6 +221,17 @@ class Trainer:
         return sample
 
     def sample_labels(self):
+        dataset = self.trainloader.dataset
+        model_ref = self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+        if hasattr(dataset, "sample_condition_batch") and getattr(model_ref, "num_angles", 0):
+            conds = dataset.sample_condition_batch(self.num_save_images, seed=self.label_seed)
+            conds["cond_mask"] = torch.ones(self.num_save_images, dtype=torch.float32)
+            start = self.rank * self.local_num_save_images
+            end = (self.rank + 1) * self.local_num_save_images
+            for key, value in conds.items():
+                if torch.is_tensor(value):
+                    conds[key] = value[start:end]
+            return conds
         if self.multitags:
             inds = torch.randint(
                 len(self.trainloader.dataset),
@@ -246,14 +293,16 @@ class Trainer:
                     desc=f"{e + 1}/{self.epochs} epochs",
                     disable=not self.is_leader
             ) as t:
-                for i, (x, y) in enumerate(t):
+                for i, batch in enumerate(t):
+                    x, y = self._split_batch(batch)
                     total_batches += 1
                     if not self.use_cfg:
                         y = None
+                    x = x.to(self.device)
+                    cond = self._prepare_condition(y) if self.use_cfg else None
                     self.step(
-                        x.to(self.device),
-                        y.float().to(self.device)
-                        if y is not None else y,
+                        x,
+                        cond,
                         update=total_batches % self.num_accum == 0
                     )
                     t.set_postfix(self.current_stats)

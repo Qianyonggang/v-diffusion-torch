@@ -1,0 +1,59 @@
+{
+  "data": {
+    "name": "sar",
+    "root": "~/datasets/sar",
+    "image_size": 256,
+    "angle_bin_size": null,
+    "center_crop": true,
+    "random_flip": false
+  },
+  "model": {
+    "in_channels": 1,
+    "out_channels": 1,
+    "hid_channels": 128,
+    "ch_multipliers": [1, 2, 2, 4],
+    "num_res_blocks": 2,
+    "apply_attn": [false, true, true, true],
+    "drop_rate": 0.1,
+    "num_heads": 4,
+    "use_xformers": false,
+    "cond_embed_each": 256
+  },
+  "diffusion": {
+    "logsnr_min": -20.0,
+    "logsnr_max": 20.0,
+    "logsnr_schedule": "cosine",
+    "train_timesteps": 1000,
+    "sample_timesteps": 50,
+    "model_out_type": "v",
+    "model_var_type": "fixed_small",
+    "intp_frac": 0.0,
+    "reweight_type": "snr_1plus",
+    "loss_type": "mse",
+    "allow_rescale": false,
+    "x0eps_coef": false
+  },
+  "conditional": {
+    "use_cfg": true,
+    "w_guide": 2.0,
+    "p_uncond": 0.1
+  },
+  "train": {
+    "seed": 1234,
+    "epochs": 800,
+    "batch_size": 16,
+    "lr": 1e-4,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "weight_decay": 0.0,
+    "grad_norm": 1.0,
+    "warmup": 5000,
+    "use_ema": true,
+    "ema_decay": 0.9999,
+    "ckpt_intv": 25,
+    "max_ckpts_kept": 5,
+    "image_intv": 25,
+    "num_save_images": 32,
+    "save_rng_state": true
+  }
+}
