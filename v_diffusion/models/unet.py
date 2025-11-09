@@ -99,6 +99,9 @@ class XFormersAttentionBlock(BaseAttentionBlock):
         k = self.to_k(x).reshape(B, -1, self.num_heads, self.head_dim).contiguous()
         v = self.to_v(x).reshape(B, -1, self.num_heads, self.head_dim).contiguous()
         x = memory_efficient_attention(q, k, v)
+        # xFormers returns (B, seq_len, num_heads, head_dim). Collapse the head dimension
+        # so the projection matches the expected hidden width.
+        x = x.reshape(B, -1, self.hid_dim).contiguous()
         x = self.proj_out(x)
         return x.transpose(1, 2).reshape(B, -1, H, W) + skip
 
