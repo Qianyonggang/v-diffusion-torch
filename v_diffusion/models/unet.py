@@ -98,7 +98,20 @@ class XFormersAttentionBlock(BaseAttentionBlock):
         q = self.to_q(x).reshape(B, -1, self.num_heads, self.head_dim).contiguous()
         k = self.to_k(x).reshape(B, -1, self.num_heads, self.head_dim).contiguous()
         v = self.to_v(x).reshape(B, -1, self.num_heads, self.head_dim).contiguous()
-        x = memory_efficient_attention(q, k, v)
+        if q.dtype in (torch.float16, torch.bfloat16):
+            x = memory_efficient_attention(q, k, v)
+        else:
+            # Fallback to the vanilla attention implementation when xFormers does not
+            # support the current dtype (notably float32).  This keeps the user visible
+            # ``use_xformers`` flag functional even on hardware without float16/bfloat16
+            # acceleration support.
+            scale = self.head_dim ** -0.5
+            q_ = q.permute(0, 2, 1, 3)  # (B, H, L, Dh)
+            k_ = k.permute(0, 2, 1, 3)
+            v_ = v.permute(0, 2, 1, 3)
+            attn = torch.matmul(q_, k_.transpose(-1, -2)) * scale
+            attn = torch.softmax(attn, dim=-1)
+            x = torch.matmul(attn, v_).permute(0, 2, 1, 3)
         # xFormers returns (B, seq_len, num_heads, head_dim). Collapse the head dimension
         # so the projection matches the expected hidden width.
         x = x.reshape(B, -1, self.hid_dim).contiguous()
