@@ -21,7 +21,9 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", type=str, default="./images/eval")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use-ema", action="store_true")
-    parser.add_argument("--use-ddim", action="store_true")
+    parser.add_argument("--use-ddim", action="store_true", help="Deprecated: use --sampler=ddim instead")
+    parser.add_argument("--sampler", type=str, choices=["default", "ddim", "dpm_solver_v3"], default="dpm_solver_v3")
+    parser.add_argument("--dpm-order", type=int, default=3, choices=[1, 2, 3])
     parser.add_argument("--sample-timesteps", type=int, default=1024)
     parser.add_argument("--uncond", action="store_true")
     parser.add_argument("--w-guide", type=float, default=0.1)
@@ -140,11 +142,22 @@ if __name__ == "__main__":
                 batch_size = total_size - i * batch_size
                 shape = (batch_size, 3, image_res, image_res)
 
-            x = diffusion.p_sample(
-                model, shape=shape, device=device,
-                noise=torch.randn(shape, device=device),
-                label=next(label_loader)[:batch_size],
-                use_ddim=args.use_ddim
-            ).cpu()
+            labels = next(label_loader)[:batch_size]
+            noise = torch.randn(shape, device=device)
+
+            if args.sampler == "dpm_solver_v3":
+                x = diffusion.dpm_solver_v3_sample(
+                    model, shape=shape, device=device,
+                    noise=noise, label=labels, order=args.dpm_order
+                )
+            else:
+                use_ddim = args.use_ddim or args.sampler == "ddim"
+                x = diffusion.p_sample(
+                    model, shape=shape, device=device,
+                    noise=noise,
+                    label=labels,
+                    use_ddim=use_ddim
+                )
+            x = x.cpu()
             x = (x * 127.5 + 127.5).clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1).numpy()
             pool.map(save_image, list(x))
