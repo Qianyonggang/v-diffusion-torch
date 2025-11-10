@@ -440,6 +440,23 @@ class GaussianDiffusion:
                 preds[idx] = pred.cpu()
         return x_t.cpu(), preds
 
+    @torch.inference_mode()
+    def dpm_solver_v3_sample(
+            self, denoise_fn, shape, noise=None, label=None,
+            device="cpu", seed=None, order: int = 3):
+        from .samplers import DPMSolverV3Sampler
+
+        sampler = DPMSolverV3Sampler(self, order=order)
+        sample = sampler.sample(
+            denoise_fn=denoise_fn,
+            shape=shape,
+            noise=noise,
+            label=label,
+            device=device,
+            seed=seed,
+        )
+        return sample.cpu()
+
     # === log likelihood ===
     # bpd: bits per dimension
 

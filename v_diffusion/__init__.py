@@ -2,6 +2,7 @@ from .datasets import get_dataloader, DATA_INFO
 from .utils import dict2str, seed_all, update_config, fill_with_defaults
 from .train_utils import Trainer, Evaluator, DummyScheduler
 from .diffusion import GaussianDiffusion, get_logsnr_schedule
+from .samplers import DPMSolverV3Sampler
 from .models.unet import UNet
 
 
@@ -17,5 +18,6 @@ __all__ = [
     "DummyScheduler",
     "GaussianDiffusion",
     "get_logsnr_schedule",
+    "DPMSolverV3Sampler",
     "UNet",
 ]
